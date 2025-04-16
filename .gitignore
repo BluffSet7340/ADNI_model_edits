@@ -65,3 +65,15 @@ mri-images/
 InceptionV3-Without Test Cases.db
 
 subject_wise_splitting
+
+heatmaps/
+
+registered/
+
+reoriented/
+
+skull_stripped/
+
+uploaded_nifti/
+
+/backend/registered/
