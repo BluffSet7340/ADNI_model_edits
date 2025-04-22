@@ -31,7 +31,7 @@
 ## Model Training and Testing Conducted via 5-Fold Cross Validation
 
 ## Model Performance for T1_augmented_hflip (horizontal flips, 900 ~ samples per class)
-
+| ViT           | 97.51%                    | 86.13%                            | 15                       | 0.0001            |
 Due to the computationally expensive nature of cross validation, in our case 5 fold cross validation, we implemented a an early stopping where if the val_loss doesn't improve after 5 epochs, it breaks and moves on to the next fold. We used the Adam Optimizer with a LR of 0.0001
 
 | Model         | Average Training Accuracy | Average Validation Accuracy       | Epochs Per Fold          | **Learning Rate** |
@@ -39,7 +39,6 @@ Due to the computationally expensive nature of cross validation, in our case 5 f
 | AlexNet       | 97.88%                    | 92.84.%                           | 15                       | 0.0001            |
 | InceptionV3   | 98.43%                    | 93.55%                            | 15                       | 0.0001            |
 | VGGNet16      | 99.42%                    | 91.93%                            | 15                       | 0.0001            |
-| ViT           | 97.51%                    | 86.13%                            | 15                       | 0.0001            |
 | ResNet18      | 99.17%                    | 93.39%                            | 15                       | 0.0001            |
 | EffcientNetB3 | 98.74%                    | 93.10%                            | 15                       | 0.0001            |
 | EffcientNetB7 | 98.61%                    | 92.94%                            | 15                       | 0.0001            |

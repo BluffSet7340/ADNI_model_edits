@@ -17,6 +17,7 @@ from torchvision.models import inception_v3, Inception_V3_Weights
 from skimage import exposure
 from PIL import Image
 from io import BytesIO
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 app = FastAPI(title="MRI Analysis API")
 app.add_middleware(
@@ -35,6 +36,18 @@ REGISTERED_DIR = Path("./registered")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 synthstrip_model_path = "/mnt/c/Users/sbm76/Downloads/synthstrip.1.pt" 
 MNI_TEMPLATE = "/home/saeed/fsl/data/standard/MNI152_T1_1mm_brain"
+
+# Define model (ViT with 3-channel input for grayscale images)
+class ViTClassifier(nn.Module):
+    def __init__(self, num_classes=3):
+        super(ViTClassifier, self).__init__()
+        # Load the pre-trained ViT model
+        self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        # Modify the final fully connected layer to match the number of classes
+        self.model.heads.head = nn.Linear(self.model.heads.head.in_features, num_classes)
+
+    def forward(self, x):
+        return self.model(x)
 
 # Define the model (InceptionV3 with 3-channel input for grayscale images)
 class InceptionV3Classifier(nn.Module):
@@ -87,9 +100,18 @@ class GradCAM:
         return cam
 
 model = InceptionV3Classifier(num_classes=3).to(device)
+
+# model = ViTClassifier(num_classes=3).to(device)
+
 model.load_state_dict(torch.load("../../InceptionV3_model.pth", map_location=device))
+
+# model.load_state_dict(torch.load("../../vit_final_model.pth", map_location=device))
+
 model.eval()
-gradcam = GradCAM(model, model.model.Mixed_7c)
+gradcam = GradCAM(model, model.model.Mixed_7c) # for inceptionV3
+
+# For ViT, use the last transformer layer in the encoder
+# gradcam = GradCAM(model, model.model.encoder.layers[-1])
 
 def run_synthstrip(input_path, output_path):
     subprocess.run(["nipreps-synthstrip", "-i", str(input_path), "-o", str(output_path), "--model", synthstrip_model_path], check=True)
@@ -110,19 +132,6 @@ def normalize_slice(slice_data):
     clipped = np.clip(slice_data, p1, p99)
     normalized = exposure.rescale_intensity(clipped, out_range=(0, 255))
     return normalized.astype(np.uint8)
-
-# def extract_middle_slice(nii_path):
-#     img = nib.load(nii_path)
-#     data = img.get_fdata()
-#     slice_idx = data.shape[2] // 2
-#     slice_data = data[:, :, slice_idx]
-    
-#     normalized = (slice_data - np.min(slice_data)) / (np.max(slice_data) - np.min(slice_data)) * 255
-#     pil_img = Image.fromarray(normalized.astype(np.uint8)).convert("RGB")
-    
-#     buffered = BytesIO()
-#     pil_img.save(buffered, format="PNG")
-#     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 def extract_middle_slice(nifti_path):
     img = nib.load(str(nifti_path))
@@ -190,13 +199,34 @@ async def preprocess(file: UploadFile = File(...)):
 async def predict(file_id: str):
     try:
         image_path = REGISTERED_DIR / f"{file_id}.nii.gz"
-        pil_image = Image.fromarray(nib.load(image_path).get_fdata()[:, :, 0]).convert("RGB")
+        # pil_image = Image.fromarray(nib.load(image_path).get_fdata()[:, :, 0]).convert("RGB")
+        
+        # img = nib.load(image_path)
+        # data = img.get_fdata()
+
+        # middle_idx = data.shape[-1] // 2
+        # slice_data = np.rot90(data[:, :, middle_idx])
+
+        # # keep this as RGB no
+        # pil_image = Image.fromarray(slice_data).convert("RGB")
+
+        pil_image = extract_middle_slice(image_path)
+
         transform = transforms.Compose([
             transforms.Grayscale(num_output_channels=3),
             transforms.Resize((299, 299)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+        # # ViT Transformations
+        # # Transformations: replicate grayscale channels to match input requirements (3 channels)
+        # transform = transforms.Compose([
+        #     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to 3 channels
+        #     transforms.Resize((224, 224)),               # Resize to ResNet18 input size
+        #     transforms.ToTensor(),                       # Convert to tensor
+        #     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])   # ImageNet std
+        # ])
         
         input_tensor = transform(pil_image).unsqueeze(0).to(device)
         
@@ -209,7 +239,7 @@ async def predict(file_id: str):
             "predicted_class": class_labels[pred_idx.item()],
             "probability": float(confidence),
             "features": {
-                "hippocampal_volume": "Reduced by 23%",
+                "hippocampal_volume": "THIS HAS TO BE REMOVED Reduced by 23%",
                 "ventricle_size": "Enlarged by 18%",
                 "cortical_thickness": "Reduced in temporal lobe"
             }
@@ -225,14 +255,38 @@ async def predict(file_id: str):
 async def gradcam_endpoint(file_id: str):
     try:
         image_path = REGISTERED_DIR / f"{file_id}.nii.gz"
-        pil_image = Image.fromarray(nib.load(image_path).get_fdata()[:, :, 0]).convert("RGB")
+
+        # img = nib.load(image_path)
+        # data = img.get_fdata()
+
+        # middle_idx = data.shape[-1] // 2
+        # slice_data = np.rot90(data[:, :, middle_idx])
+
+        # # keep this as RGB no
+        # pil_image = Image.fromarray(slice_data).convert("RGB")
+
+        pil_image = extract_middle_slice(image_path)
+
+        pil_image = pil_image.convert("RGB")
+
+        # pil_image = Image.fromarray(nib.load(image_path).get_fdata()[:, :, 0]).convert("RGB")
         
+        # InceptionV3 transformations
         transform = transforms.Compose([
             transforms.Grayscale(num_output_channels=3),
             transforms.Resize((299, 299)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
+
+        # ViT Transformations
+        # # Transformations: replicate grayscale channels to match input requirements (3 channels)
+        # transform = transforms.Compose([
+        #     transforms.Grayscale(num_output_channels=3),  # Convert grayscale to 3 channels
+        #     transforms.Resize((224, 224)),               # Resize to ResNet18 input size
+        #     transforms.ToTensor(),                       # Convert to tensor
+        #     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])   # ImageNet std
+        # ])
         
         input_tensor = transform(pil_image).unsqueeze(0).to(device)
         
