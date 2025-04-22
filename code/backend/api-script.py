@@ -64,15 +64,27 @@ class InceptionV3Classifier(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+import torch
+import numpy as np
+import cv2
 class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
+    def __init__(self, vit_classifier):
+        self.model = vit_classifier
+        self.vit = vit_classifier.model  # This is torchvision's ViT model
+
+        # Use the last transformer block (ViT has a `blocks` attribute)
+        self.target_layer = self.vit.encoder.layers[-6]
+
         self.gradients = None
         self.activations = None
-        
-        target_layer.register_forward_hook(self.save_activations)
-        target_layer.register_full_backward_hook(self.save_gradients)
+
+        # Register hooks on the target layer
+        self.target_layer.register_forward_hook(
+            lambda module, input, output: self.save_activations(module, input, output)
+        )
+        self.target_layer.register_full_backward_hook(
+            lambda module, grad_input, grad_output: self.save_gradients(module, grad_input, grad_output)
+        )
 
     def save_activations(self, module, input, output):
         self.activations = output.detach()
@@ -83,21 +95,34 @@ class GradCAM:
     def generate_cam(self, input_tensor, target_class):
         output = self.model(input_tensor)
         self.model.zero_grad()
+
         one_hot = torch.zeros_like(output)
         one_hot[0][target_class] = 1
         output.backward(gradient=one_hot, retain_graph=True)
-        
-        gradients = self.gradients.cpu().numpy()[0]
-        activations = self.activations.cpu().numpy()[0]
-        weights = np.mean(gradients, axis=(1, 2))
-        
-        cam = np.zeros(activations.shape[1:], dtype=np.float32)
-        for i, w in enumerate(weights):
-            cam += w * activations[i]
+
+        gradients = self.gradients[0].cpu().numpy()  # (tokens, channels)
+        activations = self.activations[0].cpu().numpy()  # (tokens, channels)
+
+        # Remove class token
+        gradients, activations = gradients[1:], activations[1:]
+
+        # Compute weights
+        weights = np.mean(np.abs(gradients), axis=0)  # (channels,)
+
+        # Weighted sum of activations
+        cam = np.dot(activations, weights)
+
+        num_patches = int(np.sqrt(cam.shape[0]))
+        cam = cam.reshape(num_patches, num_patches)
+
+        # Resize to 224x224
+        cam = cv2.resize(cam, (224, 224))
+
         cam = np.maximum(cam, 0)
-        cam = cv2.resize(cam, (299, 299))
-        cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam))
+        cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-8)
+
         return cam
+
 
 # model = InceptionV3Classifier(num_classes=3).to(device)
 
@@ -107,11 +132,14 @@ model = ViTClassifier(num_classes=3).to(device)
 
 model.load_state_dict(torch.load("../../vit_final_model_step_size.pth", map_location=device))
 
+# model.load_state_dict(torch.load("../../vit_final_model.pth", map_location=device))
+
+
 model.eval()
 # gradcam = GradCAM(model, model.model.Mixed_7c) # for inceptionV3
 
 # For ViT, use the last transformer layer in the encoder
-gradcam = GradCAM(model, model.model.encoder.layers[-1])
+gradcam = GradCAM(model)
 
 def run_synthstrip(input_path, output_path):
     subprocess.run(["nipreps-synthstrip", "-i", str(input_path), "-o", str(output_path), "--model", synthstrip_model_path], check=True)
@@ -228,11 +256,6 @@ async def predict(file_id: str):
         return {
             "predicted_class": class_labels[pred_idx.item()],
             "probability": float(confidence),
-            "features": {
-                "hippocampal_volume": "THIS HAS TO BE REMOVED Reduced by 23%",
-                "ventricle_size": "Enlarged by 18%",
-                "cortical_thickness": "Reduced in temporal lobe"
-            }
         }
 
     except Exception as e:
@@ -245,47 +268,52 @@ async def predict(file_id: str):
 async def gradcam_endpoint(file_id: str):
     try:
         image_path = REGISTERED_DIR / f"{file_id}.nii.gz"
-
-        pil_image = extract_middle_slice(image_path)
-
-        pil_image = pil_image.convert("RGB")
-
-        # pil_image = Image.fromarray(nib.load(image_path).get_fdata()[:, :, 0]).convert("RGB")
         
-        # # InceptionV3 transformations
-        # transform = transforms.Compose([
-        #     transforms.Grayscale(num_output_channels=3),
-        #     transforms.Resize((299, 299)),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        # ])
-
-        # ViT Transformations
-        # Transformations: replicate grayscale channels to match input requirements (3 channels)
+        # Extract middle slice and ensure RGB conversion
+        pil_image = extract_middle_slice(image_path).convert("RGB")
+        
+        # Prepare for visualization - store original before transforms
+        original_img = np.array(pil_image.resize((224, 224)))
+        
+        # ViT transformations
         transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=3),  # Convert grayscale to 3 channels
-            transforms.Resize((224, 224)),               # Resize to ResNet18 input size
-            transforms.ToTensor(),                       # Convert to tensor
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])   # ImageNet std
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
         input_tensor = transform(pil_image).unsqueeze(0).to(device)
+        pred_class = torch.argmax(model(input_tensor)).item()
         
-        cam = gradcam.generate_cam(input_tensor, 
-            torch.argmax(model(input_tensor)).item()
-        )
+        # Generate CAM
+        cam = gradcam.generate_cam(input_tensor, pred_class)
         
+        # Convert CAM to heatmap (OpenCV colormap uses BGR)
         heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(np.array(pil_image.resize((299,299))), 0.7, heatmap, 0.3, 0)
+
+        # Convert original image to OpenCV BGR (from RGB)
+        original_img_bgr = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
+
+        # Overlay the heatmap onto the original image
+        overlay = cv2.addWeighted(
+            original_img_bgr.astype(np.float32), 0.6,
+            heatmap.astype(np.float32), 0.4, 0
+        ).astype(np.uint8)
+
+        # Encode images
+        _, buffer_overlay = cv2.imencode('.png', overlay)
+        _, buffer_original = cv2.imencode('.png', original_img_bgr)
+
         
-        _, buffer = cv2.imencode('.png', overlay)
         return JSONResponse(content={
-            "heatmap": base64.b64encode(buffer).decode("utf-8")
+            "heatmap": base64.b64encode(buffer_overlay).decode("utf-8"),
+            "original": base64.b64encode(buffer_original).decode("utf-8")
         })
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"error": f"GradCAM failed: {str(e)}"}
         )
-
