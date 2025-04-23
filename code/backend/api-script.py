@@ -174,6 +174,7 @@ def extract_middle_slice(nifti_path):
     normalized = normalize_slice(slice_data)
 
     pil_image = Image.fromarray(normalized).convert("L")
+    pil_image = pil_image.resize((224, 224), Image.Resampling.BILINEAR)  # Specify resampling filter
     return pil_image
 
 @app.get("/")
@@ -206,7 +207,6 @@ async def preprocess(file: UploadFile = File(...)):
         run_flirt(reoriented_path, registered_path)
 
         pil_image = extract_middle_slice(registered_path)
-
         # Convert PIL Image to base64
         buffered = BytesIO()
         pil_image.save(buffered, format="PNG")
@@ -267,6 +267,10 @@ async def predict(file_id: str):
 @app.get("/gradcam/{file_id}")
 async def gradcam_endpoint(file_id: str):
     try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+        import matplotlib.cm as cm
+
         image_path = REGISTERED_DIR / f"{file_id}.nii.gz"
         
         # Extract middle slice and ensure RGB conversion
@@ -288,26 +292,38 @@ async def gradcam_endpoint(file_id: str):
         # Generate CAM
         cam = gradcam.generate_cam(input_tensor, pred_class)
         
-        # Convert CAM to heatmap (OpenCV colormap uses BGR)
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-
-        # Convert original image to OpenCV BGR (from RGB)
-        original_img_bgr = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
+        # Normalize CAM for overlay
+        cam_normalized = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-8)
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_normalized), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)  # Convert to RGB for overlay
 
         # Overlay the heatmap onto the original image
-        overlay = cv2.addWeighted(
-            original_img_bgr.astype(np.float32), 0.6,
-            heatmap.astype(np.float32), 0.4, 0
-        ).astype(np.uint8)
+        overlay = cv2.addWeighted(original_img.astype(np.float32), 0.6, heatmap.astype(np.float32), 0.4, 0).astype(np.uint8)
 
-        # Encode images
-        _, buffer_overlay = cv2.imencode('.png', overlay)
-        _, buffer_original = cv2.imencode('.png', original_img_bgr)
+        # Create a plot with the overlay and color bar
+        fig, ax = plt.subplots(figsize=(6, 6))
+        norm = Normalize(vmin=0, vmax=1)
+        cmap = cm.get_cmap('jet')
 
-        
+        # Display the overlay image
+        im = ax.imshow(overlay, cmap=cmap, norm=norm)
+        plt.axis('off')  # Turn off axes for the overlay
+
+        # Add color bar to the right
+        cbar = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Activation Intensity', rotation=270, labelpad=15)
+
+        # Save the plot to a buffer
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', bbox_inches='tight', pad_inches=0)
+        buffer.seek(0)
+        plt.close(fig)
+
+        # Encode the overlay with color bar as base64
+        img_with_colorbar = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
         return JSONResponse(content={
-            "heatmap": base64.b64encode(buffer_overlay).decode("utf-8"),
-            "original": base64.b64encode(buffer_original).decode("utf-8")
+            "heatmap": img_with_colorbar
         })
         
     except Exception as e:
